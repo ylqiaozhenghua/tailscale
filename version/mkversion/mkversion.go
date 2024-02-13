@@ -61,6 +61,10 @@ type VersionInfo struct {
 	// Winres is the version string that gets embedded into Windows exe
 	// metadata. It is of the form "x,y,z,0".
 	Winres string
+	// Synology is a map of Synology DSM major version to the
+	// Tailscale numeric version that gets embedded in Synology spk
+	// files.
+	Synology map[int]int64
 	// GitDate is the unix timestamp of GitHash's commit date.
 	GitDate string
 	// OtherDate is the unix timestamp of OtherHash's commit date, if any.
@@ -195,6 +199,13 @@ func tailscaleModuleRef(modBs []byte) (string, error) {
 }
 
 func mkOutput(v verInfo) (VersionInfo, error) {
+	if override := os.Getenv("TS_VERSION_OVERRIDE"); override != "" {
+		var err error
+		v.major, v.minor, v.patch, err = parseVersion(override)
+		if err != nil {
+			return VersionInfo{}, fmt.Errorf("failed to parse TS_VERSION_OVERRIDE: %w", err)
+		}
+	}
 	var changeSuffix string
 	if v.minor%2 == 1 {
 		// Odd minor numbers are unstable builds.
@@ -239,6 +250,10 @@ func mkOutput(v verInfo) (VersionInfo, error) {
 		GitHash: fmt.Sprintf("%s", v.hash),
 		GitDate: fmt.Sprintf("%s", v.date),
 		Track:   track,
+		Synology: map[int]int64{
+			6: 6*1_000_000_000 + int64(v.major-1)*1_000_000 + int64(v.minor)*1_000 + int64(v.patch),
+			7: 7*1_000_000_000 + int64(v.major-1)*1_000_000 + int64(v.minor)*1_000 + int64(v.patch),
+		},
 	}
 
 	if v.otherHash != "" {

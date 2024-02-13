@@ -5,6 +5,7 @@
 package main // import "tailscale.com/cmd/derper"
 
 import (
+	"cmp"
 	"context"
 	"crypto/tls"
 	"encoding/json"
@@ -17,11 +18,12 @@ import (
 	"math"
 	"net"
 	"net/http"
-	"net/netip"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"regexp"
 	"strings"
+	"syscall"
 	"time"
 
 	"go4.org/mem"
@@ -30,7 +32,7 @@ import (
 	"tailscale.com/derp"
 	"tailscale.com/derp/derphttp"
 	"tailscale.com/metrics"
-	"tailscale.com/net/stun"
+	"tailscale.com/net/stunserver"
 	"tailscale.com/tsweb"
 	"tailscale.com/types/key"
 )
@@ -58,25 +60,11 @@ var (
 )
 
 var (
-	stats             = new(metrics.Set)
-	stunDisposition   = &metrics.LabelMap{Label: "disposition"}
-	stunAddrFamily    = &metrics.LabelMap{Label: "family"}
 	tlsRequestVersion = &metrics.LabelMap{Label: "version"}
 	tlsActiveVersion  = &metrics.LabelMap{Label: "version"}
-
-	stunReadError  = stunDisposition.Get("read_error")
-	stunNotSTUN    = stunDisposition.Get("not_stun")
-	stunWriteError = stunDisposition.Get("write_error")
-	stunSuccess    = stunDisposition.Get("success")
-
-	stunIPv4 = stunAddrFamily.Get("ipv4")
-	stunIPv6 = stunAddrFamily.Get("ipv6")
 )
 
 func init() {
-	stats.Set("counter_requests", stunDisposition)
-	stats.Set("counter_addrfamily", stunAddrFamily)
-	expvar.Publish("stun", stats)
 	expvar.Publish("derper_tls_request_version", tlsRequestVersion)
 	expvar.Publish("gauge_derper_tls_active_version", tlsActiveVersion)
 }
@@ -134,6 +122,9 @@ func writeNewConfig() config {
 func main() {
 	flag.Parse()
 
+	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer cancel()
+
 	if *dev {
 		*addr = ":3340" // above the keys DERP
 		log.Printf("Running in dev mode.")
@@ -143,6 +134,11 @@ func main() {
 	listenHost, _, err := net.SplitHostPort(*addr)
 	if err != nil {
 		log.Fatalf("invalid server address: %v", err)
+	}
+
+	if *runSTUN {
+		ss := stunserver.New(ctx)
+		go ss.ListenAndServe(net.JoinHostPort(listenHost, fmt.Sprint(*stunPort)))
 	}
 
 	cfg := loadConfig()
@@ -181,8 +177,9 @@ func main() {
 	}
 	mux.HandleFunc("/derp/probe", probeHandler)
 	go refreshBootstrapDNSLoop()
-	mux.HandleFunc("/bootstrap-dns", handleBootstrapDNS)
+	mux.HandleFunc("/bootstrap-dns", tsweb.BrowserHeaderHandlerFunc(handleBootstrapDNS))
 	mux.Handle("/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		tsweb.AddBrowserHeaders(w)
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		w.WriteHeader(200)
 		io.WriteString(w, `<html><body>
@@ -202,6 +199,7 @@ func main() {
 		}
 	}))
 	mux.Handle("/robots.txt", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		tsweb.AddBrowserHeaders(w)
 		io.WriteString(w, "User-agent: *\nDisallow: /\n")
 	}))
 	mux.Handle("/generate_204", http.HandlerFunc(serveNoContent))
@@ -217,10 +215,6 @@ func main() {
 		}
 	}))
 	debug.Handle("traffic", "Traffic check", http.HandlerFunc(s.ServeDebugTraffic))
-
-	if *runSTUN {
-		go serveSTUN(listenHost, *stunPort)
-	}
 
 	quietLogger := log.New(logFilter{}, "", 0)
 	httpsrv := &http.Server{
@@ -238,6 +232,10 @@ func main() {
 		ReadTimeout:  30 * time.Second,
 		WriteTimeout: 30 * time.Second,
 	}
+	go func() {
+		<-ctx.Done()
+		httpsrv.Shutdown(ctx)
+	}()
 
 	if serveTLS {
 		log.Printf("derper: serving on %s with TLS", *addr)
@@ -276,18 +274,6 @@ func main() {
 				defer tlsActiveVersion.Add(label, -1)
 			}
 
-			// Set HTTP headers to appease automated security scanners.
-			//
-			// Security automation gets cranky when HTTPS sites don't
-			// set HSTS, and when they don't specify a content
-			// security policy for XSS mitigation.
-			//
-			// DERP's HTTP interface is only ever used for debug
-			// access (for which trivial safe policies work just
-			// fine), and by DERP clients which don't obey any of
-			// these browser-centric headers anyway.
-			w.Header().Set("Strict-Transport-Security", "max-age=63072000; includeSubDomains")
-			w.Header().Set("Content-Security-Policy", "default-src 'none'; frame-ancestors 'none'; form-action 'none'; base-uri 'self'; block-all-mixed-content; plugin-types 'none'")
 			mux.ServeHTTP(w, r)
 		})
 		if *httpPort > -1 {
@@ -360,59 +346,6 @@ func probeHandler(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func serveSTUN(host string, port int) {
-	pc, err := net.ListenPacket("udp", net.JoinHostPort(host, fmt.Sprint(port)))
-	if err != nil {
-		log.Fatalf("failed to open STUN listener: %v", err)
-	}
-	log.Printf("running STUN server on %v", pc.LocalAddr())
-	serverSTUNListener(context.Background(), pc.(*net.UDPConn))
-}
-
-func serverSTUNListener(ctx context.Context, pc *net.UDPConn) {
-	var buf [64 << 10]byte
-	var (
-		n   int
-		ua  *net.UDPAddr
-		err error
-	)
-	for {
-		n, ua, err = pc.ReadFromUDP(buf[:])
-		if err != nil {
-			if ctx.Err() != nil {
-				return
-			}
-			log.Printf("STUN ReadFrom: %v", err)
-			time.Sleep(time.Second)
-			stunReadError.Add(1)
-			continue
-		}
-		pkt := buf[:n]
-		if !stun.Is(pkt) {
-			stunNotSTUN.Add(1)
-			continue
-		}
-		txid, err := stun.ParseBindingRequest(pkt)
-		if err != nil {
-			stunNotSTUN.Add(1)
-			continue
-		}
-		if ua.IP.To4() != nil {
-			stunIPv4.Add(1)
-		} else {
-			stunIPv6.Add(1)
-		}
-		addr, _ := netip.AddrFromSlice(ua.IP)
-		res := stun.Response(txid, netip.AddrPortFrom(addr, uint16(ua.Port)))
-		_, err = pc.WriteTo(res, ua)
-		if err != nil {
-			stunWriteError.Add(1)
-		} else {
-			stunSuccess.Add(1)
-		}
-	}
-}
-
 var validProdHostname = regexp.MustCompile(`^derp([^.]*)\.tailscale\.com\.?$`)
 
 func prodAutocertHostPolicy(_ context.Context, host string) error {
@@ -436,11 +369,7 @@ func defaultMeshPSKFile() string {
 }
 
 func rateLimitedListenAndServeTLS(srv *http.Server) error {
-	addr := srv.Addr
-	if addr == "" {
-		addr = ":https"
-	}
-	ln, err := net.Listen("tcp", addr)
+	ln, err := net.Listen("tcp", cmp.Or(srv.Addr, ":https"))
 	if err != nil {
 		return err
 	}

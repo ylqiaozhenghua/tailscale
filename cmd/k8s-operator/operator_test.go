@@ -1,27 +1,23 @@
 // Copyright (c) Tailscale Inc & AUTHORS
 // SPDX-License-Identifier: BSD-3-Clause
 
+//go:build !plan9
+
 package main
 
 import (
-	"context"
-	"strings"
-	"sync"
+	"fmt"
 	"testing"
-	"time"
 
-	"github.com/google/go-cmp/cmp"
 	"go.uber.org/zap"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
-	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
-	"sigs.k8s.io/controller-runtime/pkg/reconcile"
-	"tailscale.com/client/tailscale"
+	tsapi "tailscale.com/k8s-operator/apis/v1alpha1"
 	"tailscale.com/types/ptr"
+	"tailscale.com/util/mak"
 )
 
 func TestLoadBalancerClass(t *testing.T) {
@@ -32,12 +28,15 @@ func TestLoadBalancerClass(t *testing.T) {
 		t.Fatal(err)
 	}
 	sr := &ServiceReconciler{
-		Client:            fc,
-		tsClient:          ft,
-		defaultTags:       []string{"tag:k8s"},
-		operatorNamespace: "operator-ns",
-		proxyImage:        "tailscale/tailscale",
-		logger:            zl.Sugar(),
+		Client: fc,
+		ssr: &tailscaleSTSReconciler{
+			Client:            fc,
+			tsClient:          ft,
+			defaultTags:       []string{"tag:k8s"},
+			operatorNamespace: "operator-ns",
+			proxyImage:        "tailscale/tailscale",
+		},
+		logger: zl.Sugar(),
 	}
 
 	// Create a service that we should manage, and check that the initial round
@@ -60,11 +59,19 @@ func TestLoadBalancerClass(t *testing.T) {
 
 	expectReconciled(t, sr, "default", "test")
 
-	fullName, shortName := findGenName(t, fc, "default", "test")
+	fullName, shortName := findGenName(t, fc, "default", "test", "svc")
+	opts := configOpts{
+		stsName:         shortName,
+		secretName:      fullName,
+		namespace:       "default",
+		parentType:      "svc",
+		hostname:        "default-test",
+		clusterTargetIP: "10.20.30.40",
+	}
 
-	expectEqual(t, fc, expectedSecret(fullName))
-	expectEqual(t, fc, expectedHeadlessService(shortName))
-	expectEqual(t, fc, expectedSTS(shortName, fullName, "default-test"))
+	expectEqual(t, fc, expectedSecret(t, opts))
+	expectEqual(t, fc, expectedHeadlessService(shortName, "svc"))
+	expectEqual(t, fc, expectedSTS(t, fc, opts))
 
 	// Normally the Tailscale proxy pod would come up here and write its info
 	// into the secret. Simulate that, then verify reconcile again and verify
@@ -75,6 +82,7 @@ func TestLoadBalancerClass(t *testing.T) {
 		}
 		s.Data["device_id"] = []byte("ts-id-1234")
 		s.Data["device_fqdn"] = []byte("tailscale.device.name.")
+		s.Data["device_ips"] = []byte(`["100.99.98.97", "2c0a:8083:94d4:2012:3165:34a5:3616:5fdf"]`)
 	})
 	expectReconciled(t, sr, "default", "test")
 	want := &corev1.Service{
@@ -99,6 +107,9 @@ func TestLoadBalancerClass(t *testing.T) {
 					{
 						Hostname: "tailscale.device.name",
 					},
+					{
+						IP: "100.99.98.97",
+					},
 				},
 			},
 		},
@@ -110,6 +121,8 @@ func TestLoadBalancerClass(t *testing.T) {
 	mustUpdate(t, fc, "default", "test", func(s *corev1.Service) {
 		s.Spec.Type = corev1.ServiceTypeClusterIP
 		s.Spec.LoadBalancerClass = nil
+	})
+	mustUpdateStatus(t, fc, "default", "test", func(s *corev1.Service) {
 		// Fake client doesn't automatically delete the LoadBalancer status when
 		// changing away from the LoadBalancer type, we have to do
 		// controller-manager's work by hand.
@@ -143,6 +156,226 @@ func TestLoadBalancerClass(t *testing.T) {
 	expectEqual(t, fc, want)
 }
 
+func TestTailnetTargetFQDNAnnotation(t *testing.T) {
+	fc := fake.NewFakeClient()
+	ft := &fakeTSClient{}
+	zl, err := zap.NewDevelopment()
+	if err != nil {
+		t.Fatal(err)
+	}
+	tailnetTargetFQDN := "foo.bar.ts.net."
+	sr := &ServiceReconciler{
+		Client: fc,
+		ssr: &tailscaleSTSReconciler{
+			Client:            fc,
+			tsClient:          ft,
+			defaultTags:       []string{"tag:k8s"},
+			operatorNamespace: "operator-ns",
+			proxyImage:        "tailscale/tailscale",
+		},
+		logger: zl.Sugar(),
+	}
+
+	// Create a service that we should manage, and check that the initial round
+	// of objects looks right.
+	mustCreate(t, fc, &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test",
+			Namespace: "default",
+			// The apiserver is supposed to set the UID, but the fake client
+			// doesn't. So, set it explicitly because other code later depends
+			// on it being set.
+			UID: types.UID("1234-UID"),
+			Annotations: map[string]string{
+				AnnotationTailnetTargetFQDN: tailnetTargetFQDN,
+			},
+		},
+		Spec: corev1.ServiceSpec{
+			Type: corev1.ServiceTypeClusterIP,
+			Selector: map[string]string{
+				"foo": "bar",
+			},
+		},
+	})
+
+	expectReconciled(t, sr, "default", "test")
+
+	fullName, shortName := findGenName(t, fc, "default", "test", "svc")
+	o := configOpts{
+		stsName:           shortName,
+		secretName:        fullName,
+		namespace:         "default",
+		parentType:        "svc",
+		tailnetTargetFQDN: tailnetTargetFQDN,
+		hostname:          "default-test",
+	}
+
+	expectEqual(t, fc, expectedSecret(t, o))
+	expectEqual(t, fc, expectedHeadlessService(shortName, "svc"))
+	expectEqual(t, fc, expectedSTS(t, fc, o))
+	want := &corev1.Service{
+		TypeMeta: metav1.TypeMeta{
+			Kind:       "Service",
+			APIVersion: "v1",
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       "test",
+			Namespace:  "default",
+			Finalizers: []string{"tailscale.com/finalizer"},
+			UID:        types.UID("1234-UID"),
+			Annotations: map[string]string{
+				AnnotationTailnetTargetFQDN: tailnetTargetFQDN,
+			},
+		},
+		Spec: corev1.ServiceSpec{
+			ExternalName: fmt.Sprintf("%s.operator-ns.svc.cluster.local", shortName),
+			Type:         corev1.ServiceTypeExternalName,
+			Selector:     nil,
+		},
+	}
+	expectEqual(t, fc, want)
+	expectEqual(t, fc, expectedSecret(t, o))
+	expectEqual(t, fc, expectedHeadlessService(shortName, "svc"))
+	expectEqual(t, fc, expectedSTS(t, fc, o))
+
+	// Change the tailscale-target-fqdn annotation which should update the
+	// StatefulSet
+	tailnetTargetFQDN = "bar.baz.ts.net"
+	mustUpdate(t, fc, "default", "test", func(s *corev1.Service) {
+		s.ObjectMeta.Annotations = map[string]string{
+			AnnotationTailnetTargetFQDN: tailnetTargetFQDN,
+		}
+	})
+
+	// Remove the tailscale-target-fqdn annotation which should make the
+	// operator clean up
+	mustUpdate(t, fc, "default", "test", func(s *corev1.Service) {
+		s.ObjectMeta.Annotations = map[string]string{}
+	})
+	expectReconciled(t, sr, "default", "test")
+
+	// // synchronous StatefulSet deletion triggers a requeue. But, the StatefulSet
+	// // didn't create any child resources since this is all faked, so the
+	// // deletion goes through immediately.
+	expectReconciled(t, sr, "default", "test")
+	expectMissing[appsv1.StatefulSet](t, fc, "operator-ns", shortName)
+	// // The deletion triggers another reconcile, to finish the cleanup.
+	expectReconciled(t, sr, "default", "test")
+	expectMissing[appsv1.StatefulSet](t, fc, "operator-ns", shortName)
+	expectMissing[corev1.Service](t, fc, "operator-ns", shortName)
+	expectMissing[corev1.Secret](t, fc, "operator-ns", fullName)
+}
+
+func TestTailnetTargetIPAnnotation(t *testing.T) {
+	fc := fake.NewFakeClient()
+	ft := &fakeTSClient{}
+	zl, err := zap.NewDevelopment()
+	if err != nil {
+		t.Fatal(err)
+	}
+	tailnetTargetIP := "100.66.66.66"
+	sr := &ServiceReconciler{
+		Client: fc,
+		ssr: &tailscaleSTSReconciler{
+			Client:            fc,
+			tsClient:          ft,
+			defaultTags:       []string{"tag:k8s"},
+			operatorNamespace: "operator-ns",
+			proxyImage:        "tailscale/tailscale",
+		},
+		logger: zl.Sugar(),
+	}
+
+	// Create a service that we should manage, and check that the initial round
+	// of objects looks right.
+	mustCreate(t, fc, &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test",
+			Namespace: "default",
+			// The apiserver is supposed to set the UID, but the fake client
+			// doesn't. So, set it explicitly because other code later depends
+			// on it being set.
+			UID: types.UID("1234-UID"),
+			Annotations: map[string]string{
+				AnnotationTailnetTargetIP: tailnetTargetIP,
+			},
+		},
+		Spec: corev1.ServiceSpec{
+			Type: corev1.ServiceTypeClusterIP,
+			Selector: map[string]string{
+				"foo": "bar",
+			},
+		},
+	})
+
+	expectReconciled(t, sr, "default", "test")
+
+	fullName, shortName := findGenName(t, fc, "default", "test", "svc")
+	o := configOpts{
+		stsName:         shortName,
+		secretName:      fullName,
+		namespace:       "default",
+		parentType:      "svc",
+		tailnetTargetIP: tailnetTargetIP,
+		hostname:        "default-test",
+	}
+
+	expectEqual(t, fc, expectedSecret(t, o))
+	expectEqual(t, fc, expectedHeadlessService(shortName, "svc"))
+	expectEqual(t, fc, expectedSTS(t, fc, o))
+	want := &corev1.Service{
+		TypeMeta: metav1.TypeMeta{
+			Kind:       "Service",
+			APIVersion: "v1",
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       "test",
+			Namespace:  "default",
+			Finalizers: []string{"tailscale.com/finalizer"},
+			UID:        types.UID("1234-UID"),
+			Annotations: map[string]string{
+				AnnotationTailnetTargetIP: tailnetTargetIP,
+			},
+		},
+		Spec: corev1.ServiceSpec{
+			ExternalName: fmt.Sprintf("%s.operator-ns.svc.cluster.local", shortName),
+			Type:         corev1.ServiceTypeExternalName,
+			Selector:     nil,
+		},
+	}
+	expectEqual(t, fc, want)
+	expectEqual(t, fc, expectedSecret(t, o))
+	expectEqual(t, fc, expectedHeadlessService(shortName, "svc"))
+	expectEqual(t, fc, expectedSTS(t, fc, o))
+
+	// Change the tailscale-target-ip annotation which should update the
+	// StatefulSet
+	tailnetTargetIP = "100.77.77.77"
+	mustUpdate(t, fc, "default", "test", func(s *corev1.Service) {
+		s.ObjectMeta.Annotations = map[string]string{
+			AnnotationTailnetTargetIP: tailnetTargetIP,
+		}
+	})
+
+	// Remove the tailscale-target-ip annotation which should make the
+	// operator clean up
+	mustUpdate(t, fc, "default", "test", func(s *corev1.Service) {
+		s.ObjectMeta.Annotations = map[string]string{}
+	})
+	expectReconciled(t, sr, "default", "test")
+
+	// // synchronous StatefulSet deletion triggers a requeue. But, the StatefulSet
+	// // didn't create any child resources since this is all faked, so the
+	// // deletion goes through immediately.
+	expectReconciled(t, sr, "default", "test")
+	expectMissing[appsv1.StatefulSet](t, fc, "operator-ns", shortName)
+	// // The deletion triggers another reconcile, to finish the cleanup.
+	expectReconciled(t, sr, "default", "test")
+	expectMissing[appsv1.StatefulSet](t, fc, "operator-ns", shortName)
+	expectMissing[corev1.Service](t, fc, "operator-ns", shortName)
+	expectMissing[corev1.Secret](t, fc, "operator-ns", fullName)
+}
+
 func TestAnnotations(t *testing.T) {
 	fc := fake.NewFakeClient()
 	ft := &fakeTSClient{}
@@ -151,12 +384,15 @@ func TestAnnotations(t *testing.T) {
 		t.Fatal(err)
 	}
 	sr := &ServiceReconciler{
-		Client:            fc,
-		tsClient:          ft,
-		defaultTags:       []string{"tag:k8s"},
-		operatorNamespace: "operator-ns",
-		proxyImage:        "tailscale/tailscale",
-		logger:            zl.Sugar(),
+		Client: fc,
+		ssr: &tailscaleSTSReconciler{
+			Client:            fc,
+			tsClient:          ft,
+			defaultTags:       []string{"tag:k8s"},
+			operatorNamespace: "operator-ns",
+			proxyImage:        "tailscale/tailscale",
+		},
+		logger: zl.Sugar(),
 	}
 
 	// Create a service that we should manage, and check that the initial round
@@ -181,11 +417,19 @@ func TestAnnotations(t *testing.T) {
 
 	expectReconciled(t, sr, "default", "test")
 
-	fullName, shortName := findGenName(t, fc, "default", "test")
+	fullName, shortName := findGenName(t, fc, "default", "test", "svc")
+	o := configOpts{
+		stsName:         shortName,
+		secretName:      fullName,
+		namespace:       "default",
+		parentType:      "svc",
+		hostname:        "default-test",
+		clusterTargetIP: "10.20.30.40",
+	}
 
-	expectEqual(t, fc, expectedSecret(fullName))
-	expectEqual(t, fc, expectedHeadlessService(shortName))
-	expectEqual(t, fc, expectedSTS(shortName, fullName, "default-test"))
+	expectEqual(t, fc, expectedSecret(t, o))
+	expectEqual(t, fc, expectedHeadlessService(shortName, "svc"))
+	expectEqual(t, fc, expectedSTS(t, fc, o))
 	want := &corev1.Service{
 		TypeMeta: metav1.TypeMeta{
 			Kind:       "Service",
@@ -248,12 +492,15 @@ func TestAnnotationIntoLB(t *testing.T) {
 		t.Fatal(err)
 	}
 	sr := &ServiceReconciler{
-		Client:            fc,
-		tsClient:          ft,
-		defaultTags:       []string{"tag:k8s"},
-		operatorNamespace: "operator-ns",
-		proxyImage:        "tailscale/tailscale",
-		logger:            zl.Sugar(),
+		Client: fc,
+		ssr: &tailscaleSTSReconciler{
+			Client:            fc,
+			tsClient:          ft,
+			defaultTags:       []string{"tag:k8s"},
+			operatorNamespace: "operator-ns",
+			proxyImage:        "tailscale/tailscale",
+		},
+		logger: zl.Sugar(),
 	}
 
 	// Create a service that we should manage, and check that the initial round
@@ -278,11 +525,19 @@ func TestAnnotationIntoLB(t *testing.T) {
 
 	expectReconciled(t, sr, "default", "test")
 
-	fullName, shortName := findGenName(t, fc, "default", "test")
+	fullName, shortName := findGenName(t, fc, "default", "test", "svc")
+	o := configOpts{
+		stsName:         shortName,
+		secretName:      fullName,
+		namespace:       "default",
+		parentType:      "svc",
+		hostname:        "default-test",
+		clusterTargetIP: "10.20.30.40",
+	}
 
-	expectEqual(t, fc, expectedSecret(fullName))
-	expectEqual(t, fc, expectedHeadlessService(shortName))
-	expectEqual(t, fc, expectedSTS(shortName, fullName, "default-test"))
+	expectEqual(t, fc, expectedSecret(t, o))
+	expectEqual(t, fc, expectedHeadlessService(shortName, "svc"))
+	expectEqual(t, fc, expectedSTS(t, fc, o))
 
 	// Normally the Tailscale proxy pod would come up here and write its info
 	// into the secret. Simulate that, since it would have normally happened at
@@ -293,6 +548,7 @@ func TestAnnotationIntoLB(t *testing.T) {
 		}
 		s.Data["device_id"] = []byte("ts-id-1234")
 		s.Data["device_fqdn"] = []byte("tailscale.device.name.")
+		s.Data["device_ips"] = []byte(`["100.99.98.97", "2c0a:8083:94d4:2012:3165:34a5:3616:5fdf"]`)
 	})
 	expectReconciled(t, sr, "default", "test")
 	want := &corev1.Service{
@@ -325,8 +581,8 @@ func TestAnnotationIntoLB(t *testing.T) {
 	})
 	expectReconciled(t, sr, "default", "test")
 	// None of the proxy machinery should have changed...
-	expectEqual(t, fc, expectedHeadlessService(shortName))
-	expectEqual(t, fc, expectedSTS(shortName, fullName, "default-test"))
+	expectEqual(t, fc, expectedHeadlessService(shortName, "svc"))
+	expectEqual(t, fc, expectedSTS(t, fc, o))
 	// ... but the service should have a LoadBalancer status.
 
 	want = &corev1.Service{
@@ -351,6 +607,9 @@ func TestAnnotationIntoLB(t *testing.T) {
 					{
 						Hostname: "tailscale.device.name",
 					},
+					{
+						IP: "100.99.98.97",
+					},
 				},
 			},
 		},
@@ -366,12 +625,15 @@ func TestLBIntoAnnotation(t *testing.T) {
 		t.Fatal(err)
 	}
 	sr := &ServiceReconciler{
-		Client:            fc,
-		tsClient:          ft,
-		defaultTags:       []string{"tag:k8s"},
-		operatorNamespace: "operator-ns",
-		proxyImage:        "tailscale/tailscale",
-		logger:            zl.Sugar(),
+		Client: fc,
+		ssr: &tailscaleSTSReconciler{
+			Client:            fc,
+			tsClient:          ft,
+			defaultTags:       []string{"tag:k8s"},
+			operatorNamespace: "operator-ns",
+			proxyImage:        "tailscale/tailscale",
+		},
+		logger: zl.Sugar(),
 	}
 
 	// Create a service that we should manage, and check that the initial round
@@ -394,11 +656,19 @@ func TestLBIntoAnnotation(t *testing.T) {
 
 	expectReconciled(t, sr, "default", "test")
 
-	fullName, shortName := findGenName(t, fc, "default", "test")
+	fullName, shortName := findGenName(t, fc, "default", "test", "svc")
+	o := configOpts{
+		stsName:         shortName,
+		secretName:      fullName,
+		namespace:       "default",
+		parentType:      "svc",
+		hostname:        "default-test",
+		clusterTargetIP: "10.20.30.40",
+	}
 
-	expectEqual(t, fc, expectedSecret(fullName))
-	expectEqual(t, fc, expectedHeadlessService(shortName))
-	expectEqual(t, fc, expectedSTS(shortName, fullName, "default-test"))
+	expectEqual(t, fc, expectedSecret(t, o))
+	expectEqual(t, fc, expectedHeadlessService(shortName, "svc"))
+	expectEqual(t, fc, expectedSTS(t, fc, o))
 
 	// Normally the Tailscale proxy pod would come up here and write its info
 	// into the secret. Simulate that, then verify reconcile again and verify
@@ -409,6 +679,7 @@ func TestLBIntoAnnotation(t *testing.T) {
 		}
 		s.Data["device_id"] = []byte("ts-id-1234")
 		s.Data["device_fqdn"] = []byte("tailscale.device.name.")
+		s.Data["device_ips"] = []byte(`["100.99.98.97", "2c0a:8083:94d4:2012:3165:34a5:3616:5fdf"]`)
 	})
 	expectReconciled(t, sr, "default", "test")
 	want := &corev1.Service{
@@ -433,6 +704,9 @@ func TestLBIntoAnnotation(t *testing.T) {
 					{
 						Hostname: "tailscale.device.name",
 					},
+					{
+						IP: "100.99.98.97",
+					},
 				},
 			},
 		},
@@ -447,6 +721,8 @@ func TestLBIntoAnnotation(t *testing.T) {
 		}
 		s.Spec.Type = corev1.ServiceTypeClusterIP
 		s.Spec.LoadBalancerClass = nil
+	})
+	mustUpdateStatus(t, fc, "default", "test", func(s *corev1.Service) {
 		// Fake client doesn't automatically delete the LoadBalancer status when
 		// changing away from the LoadBalancer type, we have to do
 		// controller-manager's work by hand.
@@ -454,8 +730,8 @@ func TestLBIntoAnnotation(t *testing.T) {
 	})
 	expectReconciled(t, sr, "default", "test")
 
-	expectEqual(t, fc, expectedHeadlessService(shortName))
-	expectEqual(t, fc, expectedSTS(shortName, fullName, "default-test"))
+	expectEqual(t, fc, expectedHeadlessService(shortName, "svc"))
+	expectEqual(t, fc, expectedSTS(t, fc, o))
 
 	want = &corev1.Service{
 		TypeMeta: metav1.TypeMeta{
@@ -487,12 +763,15 @@ func TestCustomHostname(t *testing.T) {
 		t.Fatal(err)
 	}
 	sr := &ServiceReconciler{
-		Client:            fc,
-		tsClient:          ft,
-		defaultTags:       []string{"tag:k8s"},
-		operatorNamespace: "operator-ns",
-		proxyImage:        "tailscale/tailscale",
-		logger:            zl.Sugar(),
+		Client: fc,
+		ssr: &tailscaleSTSReconciler{
+			Client:            fc,
+			tsClient:          ft,
+			defaultTags:       []string{"tag:k8s"},
+			operatorNamespace: "operator-ns",
+			proxyImage:        "tailscale/tailscale",
+		},
+		logger: zl.Sugar(),
 	}
 
 	// Create a service that we should manage, and check that the initial round
@@ -518,11 +797,19 @@ func TestCustomHostname(t *testing.T) {
 
 	expectReconciled(t, sr, "default", "test")
 
-	fullName, shortName := findGenName(t, fc, "default", "test")
+	fullName, shortName := findGenName(t, fc, "default", "test", "svc")
+	o := configOpts{
+		stsName:         shortName,
+		secretName:      fullName,
+		namespace:       "default",
+		parentType:      "svc",
+		hostname:        "reindeer-flotilla",
+		clusterTargetIP: "10.20.30.40",
+	}
 
-	expectEqual(t, fc, expectedSecret(fullName))
-	expectEqual(t, fc, expectedHeadlessService(shortName))
-	expectEqual(t, fc, expectedSTS(shortName, fullName, "reindeer-flotilla"))
+	expectEqual(t, fc, expectedSecret(t, o))
+	expectEqual(t, fc, expectedHeadlessService(shortName, "svc"))
+	expectEqual(t, fc, expectedSTS(t, fc, o))
 	want := &corev1.Service{
 		TypeMeta: metav1.TypeMeta{
 			Kind:       "Service",
@@ -581,259 +868,290 @@ func TestCustomHostname(t *testing.T) {
 	expectEqual(t, fc, want)
 }
 
-func expectedSecret(name string) *corev1.Secret {
-	return &corev1.Secret{
-		TypeMeta: metav1.TypeMeta{
-			Kind:       "Secret",
-			APIVersion: "v1",
-		},
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      name,
-			Namespace: "operator-ns",
-			Labels: map[string]string{
-				"tailscale.com/managed":              "true",
-				"tailscale.com/parent-resource":      "test",
-				"tailscale.com/parent-resource-ns":   "default",
-				"tailscale.com/parent-resource-type": "svc",
-			},
-		},
-		StringData: map[string]string{
-			"authkey": "secret-authkey",
-		},
+func TestCustomPriorityClassName(t *testing.T) {
+	fc := fake.NewFakeClient()
+	ft := &fakeTSClient{}
+	zl, err := zap.NewDevelopment()
+	if err != nil {
+		t.Fatal(err)
 	}
-}
-
-func expectedHeadlessService(name string) *corev1.Service {
-	return &corev1.Service{
-		TypeMeta: metav1.TypeMeta{
-			Kind:       "Service",
-			APIVersion: "v1",
+	sr := &ServiceReconciler{
+		Client: fc,
+		ssr: &tailscaleSTSReconciler{
+			Client:                 fc,
+			tsClient:               ft,
+			defaultTags:            []string{"tag:k8s"},
+			operatorNamespace:      "operator-ns",
+			proxyImage:             "tailscale/tailscale",
+			proxyPriorityClassName: "custom-priority-class-name",
 		},
+		logger: zl.Sugar(),
+	}
+
+	// Create a service that we should manage, and check that the initial round
+	// of objects looks right.
+	mustCreate(t, fc, &corev1.Service{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:         name,
-			GenerateName: "ts-test-",
-			Namespace:    "operator-ns",
-			Labels: map[string]string{
-				"tailscale.com/managed":              "true",
-				"tailscale.com/parent-resource":      "test",
-				"tailscale.com/parent-resource-ns":   "default",
-				"tailscale.com/parent-resource-type": "svc",
+			Name:      "test",
+			Namespace: "default",
+			// The apiserver is supposed to set the UID, but the fake client
+			// doesn't. So, set it explicitly because other code later depends
+			// on it being set.
+			UID: types.UID("1234-UID"),
+			Annotations: map[string]string{
+				"tailscale.com/expose":   "true",
+				"tailscale.com/hostname": "tailscale-critical",
 			},
 		},
 		Spec: corev1.ServiceSpec{
-			Selector: map[string]string{
-				"app": "1234-UID",
-			},
-			ClusterIP: "None",
+			ClusterIP: "10.20.30.40",
+			Type:      corev1.ServiceTypeClusterIP,
 		},
+	})
+
+	expectReconciled(t, sr, "default", "test")
+
+	fullName, shortName := findGenName(t, fc, "default", "test", "svc")
+	o := configOpts{
+		stsName:           shortName,
+		secretName:        fullName,
+		namespace:         "default",
+		parentType:        "svc",
+		hostname:          "tailscale-critical",
+		priorityClassName: "custom-priority-class-name",
+		clusterTargetIP:   "10.20.30.40",
 	}
+
+	expectEqual(t, fc, expectedSTS(t, fc, o))
 }
 
-func expectedSTS(stsName, secretName, hostname string) *appsv1.StatefulSet {
-	return &appsv1.StatefulSet{
-		TypeMeta: metav1.TypeMeta{
-			Kind:       "StatefulSet",
-			APIVersion: "apps/v1",
+func TestProxyClassForService(t *testing.T) {
+	// Setup
+	pc := &tsapi.ProxyClass{
+		ObjectMeta: metav1.ObjectMeta{Name: "custom-metadata"},
+		Spec: tsapi.ProxyClassSpec{StatefulSet: &tsapi.StatefulSet{
+			Labels:      map[string]string{"foo": "bar"},
+			Annotations: map[string]string{"bar.io/foo": "some-val"},
+			Pod:         &tsapi.Pod{Annotations: map[string]string{"foo.io/bar": "some-val"}}}},
+	}
+	fc := fake.NewClientBuilder().
+		WithScheme(tsapi.GlobalScheme).
+		WithObjects(pc).
+		WithStatusSubresource(pc).
+		Build()
+	ft := &fakeTSClient{}
+	zl, err := zap.NewDevelopment()
+	if err != nil {
+		t.Fatal(err)
+	}
+	sr := &ServiceReconciler{
+		Client: fc,
+		ssr: &tailscaleSTSReconciler{
+			Client:            fc,
+			tsClient:          ft,
+			defaultTags:       []string{"tag:k8s"},
+			operatorNamespace: "operator-ns",
+			proxyImage:        "tailscale/tailscale",
 		},
+		logger: zl.Sugar(),
+	}
+
+	// 1. A new tailscale LoadBalancer Service is created without any
+	// ProxyClass. Resources get created for it as usual.
+	mustCreate(t, fc, &corev1.Service{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      stsName,
-			Namespace: "operator-ns",
-			Labels: map[string]string{
-				"tailscale.com/managed":              "true",
-				"tailscale.com/parent-resource":      "test",
-				"tailscale.com/parent-resource-ns":   "default",
-				"tailscale.com/parent-resource-type": "svc",
-			},
+			Name:      "test",
+			Namespace: "default",
+			// The apiserver is supposed to set the UID, but the fake client
+			// doesn't. So, set it explicitly because other code later depends
+			// on it being set.
+			UID: types.UID("1234-UID"),
 		},
-		Spec: appsv1.StatefulSetSpec{
-			Replicas: ptr.To[int32](1),
-			Selector: &metav1.LabelSelector{
-				MatchLabels: map[string]string{"app": "1234-UID"},
-			},
-			ServiceName: stsName,
-			Template: corev1.PodTemplateSpec{
-				ObjectMeta: metav1.ObjectMeta{
-					DeletionGracePeriodSeconds: ptr.To[int64](10),
-					Labels:                     map[string]string{"app": "1234-UID"},
-				},
-				Spec: corev1.PodSpec{
-					ServiceAccountName: "proxies",
-					InitContainers: []corev1.Container{
-						{
-							Name:    "sysctler",
-							Image:   "busybox",
-							Command: []string{"/bin/sh"},
-							Args:    []string{"-c", "sysctl -w net.ipv4.ip_forward=1 net.ipv6.conf.all.forwarding=1"},
-							SecurityContext: &corev1.SecurityContext{
-								Privileged: ptr.To(true),
-							},
-						},
-					},
-					Containers: []corev1.Container{
-						{
-							Name:  "tailscale",
-							Image: "tailscale/tailscale",
-							Env: []corev1.EnvVar{
-								{Name: "TS_USERSPACE", Value: "false"},
-								{Name: "TS_AUTH_ONCE", Value: "true"},
-								{Name: "TS_DEST_IP", Value: "10.20.30.40"},
-								{Name: "TS_KUBE_SECRET", Value: secretName},
-								{Name: "TS_HOSTNAME", Value: hostname},
-							},
-							SecurityContext: &corev1.SecurityContext{
-								Capabilities: &corev1.Capabilities{
-									Add: []corev1.Capability{"NET_ADMIN"},
-								},
-							},
-							ImagePullPolicy: "Always",
-						},
-					},
-				},
-			},
+		Spec: corev1.ServiceSpec{
+			ClusterIP:         "10.20.30.40",
+			Type:              corev1.ServiceTypeLoadBalancer,
+			LoadBalancerClass: ptr.To("tailscale"),
 		},
+	})
+	expectReconciled(t, sr, "default", "test")
+	fullName, shortName := findGenName(t, fc, "default", "test", "svc")
+	opts := configOpts{
+		stsName:         shortName,
+		secretName:      fullName,
+		namespace:       "default",
+		parentType:      "svc",
+		hostname:        "default-test",
+		clusterTargetIP: "10.20.30.40",
 	}
+	expectEqual(t, fc, expectedSecret(t, opts))
+	expectEqual(t, fc, expectedHeadlessService(shortName, "svc"))
+	expectEqual(t, fc, expectedSTS(t, fc, opts))
+
+	// 2. The Service gets updated with tailscale.com/proxy-class label
+	// pointing at the 'custom-metadata' ProxyClass. The ProxyClass is not
+	// yet ready, so no changes are actually applied to the proxy resources.
+	mustUpdate(t, fc, "default", "test", func(svc *corev1.Service) {
+		mak.Set(&svc.Labels, LabelProxyClass, "custom-metadata")
+	})
+	expectReconciled(t, sr, "default", "test")
+	expectEqual(t, fc, expectedSTS(t, fc, opts))
+
+	// 3. ProxyClass is set to Ready, the Service gets reconciled by the
+	// services-reconciler and the customization from the ProxyClass is
+	// applied to the proxy resources.
+	mustUpdateStatus(t, fc, "", "custom-metadata", func(pc *tsapi.ProxyClass) {
+		pc.Status = tsapi.ProxyClassStatus{
+			Conditions: []tsapi.ConnectorCondition{{
+				Status:             metav1.ConditionTrue,
+				Type:               tsapi.ProxyClassready,
+				ObservedGeneration: pc.Generation,
+			}}}
+	})
+	opts.proxyClass = pc.Name
+	expectReconciled(t, sr, "default", "test")
+	expectEqual(t, fc, expectedSTS(t, fc, opts))
+
+	// 4. tailscale.com/proxy-class label is removed from the Service, the
+	// configuration from the ProxyClass is removed from the cluster
+	// resources.
+	mustUpdate(t, fc, "default", "test", func(svc *corev1.Service) {
+		delete(svc.Labels, LabelProxyClass)
+	})
+	opts.proxyClass = ""
+	expectReconciled(t, sr, "default", "test")
+	expectEqual(t, fc, expectedSTS(t, fc, opts))
 }
 
-func findGenName(t *testing.T, client client.Client, ns, name string) (full, noSuffix string) {
-	t.Helper()
-	labels := map[string]string{
-		LabelManaged:         "true",
-		LabelParentName:      name,
-		LabelParentNamespace: ns,
-		LabelParentType:      "svc",
-	}
-	s, err := getSingleObject[corev1.Secret](context.Background(), client, "operator-ns", labels)
+func TestDefaultLoadBalancer(t *testing.T) {
+	fc := fake.NewFakeClient()
+	ft := &fakeTSClient{}
+	zl, err := zap.NewDevelopment()
 	if err != nil {
-		t.Fatalf("finding secret for %q: %v", name, err)
+		t.Fatal(err)
 	}
-	return s.GetName(), strings.TrimSuffix(s.GetName(), "-0")
+	sr := &ServiceReconciler{
+		Client: fc,
+		ssr: &tailscaleSTSReconciler{
+			Client:            fc,
+			tsClient:          ft,
+			defaultTags:       []string{"tag:k8s"},
+			operatorNamespace: "operator-ns",
+			proxyImage:        "tailscale/tailscale",
+		},
+		logger:                zl.Sugar(),
+		isDefaultLoadBalancer: true,
+	}
+
+	// Create a service that we should manage, and check that the initial round
+	// of objects looks right.
+	mustCreate(t, fc, &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test",
+			Namespace: "default",
+			// The apiserver is supposed to set the UID, but the fake client
+			// doesn't. So, set it explicitly because other code later depends
+			// on it being set.
+			UID: types.UID("1234-UID"),
+		},
+		Spec: corev1.ServiceSpec{
+			ClusterIP: "10.20.30.40",
+			Type:      corev1.ServiceTypeLoadBalancer,
+		},
+	})
+
+	expectReconciled(t, sr, "default", "test")
+
+	fullName, shortName := findGenName(t, fc, "default", "test", "svc")
+
+	expectEqual(t, fc, expectedHeadlessService(shortName, "svc"))
+	o := configOpts{
+		stsName:         shortName,
+		secretName:      fullName,
+		namespace:       "default",
+		parentType:      "svc",
+		hostname:        "default-test",
+		clusterTargetIP: "10.20.30.40",
+	}
+	expectEqual(t, fc, expectedSTS(t, fc, o))
 }
 
-func mustCreate(t *testing.T, client client.Client, obj client.Object) {
-	t.Helper()
-	if err := client.Create(context.Background(), obj); err != nil {
-		t.Fatalf("creating %q: %v", obj.GetName(), err)
+func TestProxyFirewallMode(t *testing.T) {
+	fc := fake.NewFakeClient()
+	ft := &fakeTSClient{}
+	zl, err := zap.NewDevelopment()
+	if err != nil {
+		t.Fatal(err)
 	}
+	sr := &ServiceReconciler{
+		Client: fc,
+		ssr: &tailscaleSTSReconciler{
+			Client:            fc,
+			tsClient:          ft,
+			defaultTags:       []string{"tag:k8s"},
+			operatorNamespace: "operator-ns",
+			proxyImage:        "tailscale/tailscale",
+			tsFirewallMode:    "nftables",
+		},
+		logger:                zl.Sugar(),
+		isDefaultLoadBalancer: true,
+	}
+
+	// Create a service that we should manage, and check that the initial round
+	// of objects looks right.
+	mustCreate(t, fc, &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test",
+			Namespace: "default",
+			// The apiserver is supposed to set the UID, but the fake client
+			// doesn't. So, set it explicitly because other code later depends
+			// on it being set.
+			UID: types.UID("1234-UID"),
+		},
+		Spec: corev1.ServiceSpec{
+			ClusterIP: "10.20.30.40",
+			Type:      corev1.ServiceTypeLoadBalancer,
+		},
+	})
+
+	expectReconciled(t, sr, "default", "test")
+
+	fullName, shortName := findGenName(t, fc, "default", "test", "svc")
+	o := configOpts{
+		stsName:         shortName,
+		secretName:      fullName,
+		namespace:       "default",
+		parentType:      "svc",
+		hostname:        "default-test",
+		firewallMode:    "nftables",
+		clusterTargetIP: "10.20.30.40",
+	}
+	expectEqual(t, fc, expectedSTS(t, fc, o))
+
 }
 
-func mustUpdate[T any, O ptrObject[T]](t *testing.T, client client.Client, ns, name string, update func(O)) {
-	t.Helper()
-	obj := O(new(T))
-	if err := client.Get(context.Background(), types.NamespacedName{
-		Name:      name,
-		Namespace: ns,
-	}, obj); err != nil {
-		t.Fatalf("getting %q: %v", name, err)
-	}
-	update(obj)
-	if err := client.Update(context.Background(), obj); err != nil {
-		t.Fatalf("updating %q: %v", name, err)
-	}
-}
-
-func expectEqual[T any, O ptrObject[T]](t *testing.T, client client.Client, want O) {
-	t.Helper()
-	got := O(new(T))
-	if err := client.Get(context.Background(), types.NamespacedName{
-		Name:      want.GetName(),
-		Namespace: want.GetNamespace(),
-	}, got); err != nil {
-		t.Fatalf("getting %q: %v", want.GetName(), err)
-	}
-	// The resource version changes eagerly whenever the operator does even a
-	// no-op update. Asserting a specific value leads to overly brittle tests,
-	// so just remove it from both got and want.
-	got.SetResourceVersion("")
-	want.SetResourceVersion("")
-	if diff := cmp.Diff(got, want); diff != "" {
-		t.Fatalf("unexpected object (-got +want):\n%s", diff)
-	}
-}
-
-func expectMissing[T any, O ptrObject[T]](t *testing.T, client client.Client, ns, name string) {
-	t.Helper()
-	obj := O(new(T))
-	if err := client.Get(context.Background(), types.NamespacedName{
-		Name:      name,
-		Namespace: ns,
-	}, obj); !apierrors.IsNotFound(err) {
-		t.Fatalf("object %s/%s unexpectedly present, wanted missing", ns, name)
-	}
-}
-
-func expectReconciled(t *testing.T, sr *ServiceReconciler, ns, name string) {
-	t.Helper()
-	req := reconcile.Request{
-		NamespacedName: types.NamespacedName{
-			Name:      name,
-			Namespace: ns,
+func Test_isMagicDNSName(t *testing.T) {
+	tests := []struct {
+		in   string
+		want bool
+	}{
+		{
+			in:   "foo.tail4567.ts.net",
+			want: true,
+		},
+		{
+			in:   "foo.tail4567.ts.net.",
+			want: true,
+		},
+		{
+			in:   "foo.tail4567",
+			want: false,
 		},
 	}
-	res, err := sr.Reconcile(context.Background(), req)
-	if err != nil {
-		t.Fatalf("Reconcile: unexpected error: %v", err)
+	for _, tt := range tests {
+		t.Run(tt.in, func(t *testing.T) {
+			if got := isMagicDNSName(tt.in); got != tt.want {
+				t.Errorf("isMagicDNSName(%q) = %v, want %v", tt.in, got, tt.want)
+			}
+		})
 	}
-	if res.Requeue {
-		t.Fatalf("unexpected immediate requeue")
-	}
-	if res.RequeueAfter != 0 {
-		t.Fatalf("unexpected timed requeue (%v)", res.RequeueAfter)
-	}
-}
-
-func expectRequeue(t *testing.T, sr *ServiceReconciler, ns, name string) {
-	t.Helper()
-	req := reconcile.Request{
-		NamespacedName: types.NamespacedName{
-			Name:      name,
-			Namespace: ns,
-		},
-	}
-	res, err := sr.Reconcile(context.Background(), req)
-	if err != nil {
-		t.Fatalf("Reconcile: unexpected error: %v", err)
-	}
-	if res.Requeue {
-		t.Fatalf("unexpected immediate requeue")
-	}
-	if res.RequeueAfter == 0 {
-		t.Fatalf("expected timed requeue, got success")
-	}
-}
-
-type fakeTSClient struct {
-	sync.Mutex
-	keyRequests []tailscale.KeyCapabilities
-	deleted     []string
-}
-
-func (c *fakeTSClient) CreateKey(ctx context.Context, caps tailscale.KeyCapabilities) (string, *tailscale.Key, error) {
-	c.Lock()
-	defer c.Unlock()
-	c.keyRequests = append(c.keyRequests, caps)
-	k := &tailscale.Key{
-		ID:           "key",
-		Created:      time.Now(),
-		Capabilities: caps,
-	}
-	return "secret-authkey", k, nil
-}
-
-func (c *fakeTSClient) DeleteDevice(ctx context.Context, deviceID string) error {
-	c.Lock()
-	defer c.Unlock()
-	c.deleted = append(c.deleted, deviceID)
-	return nil
-}
-
-func (c *fakeTSClient) KeyRequests() []tailscale.KeyCapabilities {
-	c.Lock()
-	defer c.Unlock()
-	return c.keyRequests
-}
-
-func (c *fakeTSClient) Deleted() []string {
-	c.Lock()
-	defer c.Unlock()
-	return c.deleted
 }

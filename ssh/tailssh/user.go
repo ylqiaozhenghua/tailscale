@@ -6,10 +6,7 @@
 package tailssh
 
 import (
-	"context"
-	"errors"
 	"io"
-	"log"
 	"os"
 	"os/exec"
 	"os/user"
@@ -17,13 +14,12 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
-	"time"
-	"unicode/utf8"
 
 	"go4.org/mem"
 	"tailscale.com/envknob"
 	"tailscale.com/hostinfo"
 	"tailscale.com/util/lineread"
+	"tailscale.com/util/osuser"
 	"tailscale.com/version/distro"
 )
 
@@ -48,80 +44,14 @@ func (u *userMeta) GroupIds() ([]string, error) {
 	return u.User.GroupIds()
 }
 
-// userLookup is like os/user.LookupId but it returns a *userMeta wrapper
+// userLookup is like os/user.Lookup but it returns a *userMeta wrapper
 // around a *user.User with extra fields.
-func userLookup(uid string) (*userMeta, error) {
-	if runtime.GOOS != "linux" {
-		return userLookupStd(uid)
-	}
-
-	// No getent on Gokrazy. So hard-code the login shell.
-	if distro.Get() == distro.Gokrazy {
-		um, err := userLookupStd(uid)
-		if err == nil {
-			um.loginShellCached = "/tmp/serial-busybox/ash"
-		}
-		return um, err
-	}
-
-	// On Linux, default to using "getent" to look up users so that
-	// even with static tailscaled binaries without cgo (as we distribute),
-	// we can still look up PAM/NSS users which the standard library's
-	// os/user without cgo won't get (because of no libc hooks).
-	// But if "getent" fails, userLookupGetent falls back to the standard
-	// library anyway.
-	return userLookupGetent(uid)
-}
-
-func validUsername(uid string) bool {
-	if len(uid) > 32 || len(uid) == 0 {
-		return false
-	}
-	for _, r := range uid {
-		if r < ' ' || r == 0x7f || r == utf8.RuneError { // TODO(bradfitz): more?
-			return false
-		}
-	}
-	return true
-}
-
-func userLookupGetent(uid string) (*userMeta, error) {
-	// Do some basic validation before passing this string to "getent", even though
-	// getent should do its own validation.
-	if !validUsername(uid) {
-		return nil, errors.New("invalid username")
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	out, err := exec.CommandContext(ctx, "getent", "passwd", uid).Output()
-	if err != nil {
-		log.Printf("error calling getent for user %q: %v", uid, err)
-		return userLookupStd(uid)
-	}
-	// output is "alice:x:1001:1001:Alice Smith,,,:/home/alice:/bin/bash"
-	f := strings.SplitN(strings.TrimSpace(string(out)), ":", 10)
-	for len(f) < 7 {
-		f = append(f, "")
-	}
-	um := &userMeta{
-		User: user.User{
-			Username: f[0],
-			Uid:      f[2],
-			Gid:      f[3],
-			Name:     f[4],
-			HomeDir:  f[5],
-		},
-		loginShellCached: f[6],
-	}
-	return um, nil
-}
-
-func userLookupStd(uid string) (*userMeta, error) {
-	u, err := user.LookupId(uid)
+func userLookup(username string) (*userMeta, error) {
+	u, s, err := osuser.LookupByUsernameWithShell(username)
 	if err != nil {
 		return nil, err
 	}
-	return &userMeta{User: *u}, nil
+	return &userMeta{User: *u, loginShellCached: s}, nil
 }
 
 func (u *userMeta) LoginShell() string {
